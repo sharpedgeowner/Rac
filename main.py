@@ -2,126 +2,158 @@ import discord
 import os
 import asyncio
 import requests
-from datetime import datetime, timedelta
-import pytz
+from datetime import datetime, timezone
+from requests.auth import HTTPBasicAuth  # <-- import this
 
-# ---------- ENVIRONMENT VARIABLES ----------
+# ===== ENV VARS =====
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-API_KEY = os.getenv("RACING_API_KEY")
-MIN_EV = float(os.getenv("MIN_EV", 0.05))
-MAX_LOOKAHEAD_HOURS = int(os.getenv("MAX_LOOKAHEAD_HOURS", 24))
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", 0.1))
+RACING_API_USERNAME = os.getenv("RACING_API_USERNAME")
+RACING_API_PASSWORD = os.getenv("RACING_API_PASSWORD")
 
-# ---------- TIMEZONE ----------
-AU_TZ = pytz.timezone("Australia/Sydney")
+# ===== CONFIG =====
+REGION = "au"
+MIN_EV = 0.03
+MAX_HOURS_TO_START = 24
+CHECK_INTERVAL = 900
 
-# ---------- Discord Setup ----------
+TRUSTED_BOOKS = ["TAB", "Sportsbet", "PointsBet", "Neds", "Betfair AU"]
+
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-# ---------- TRACK POSTED BETS ----------
-posted_bets = {}  # structure: {race_id: {horse_id: True}}
+posted_bets = set()
+last_odds = {}
 
-# ---------- UTILITY FUNCTIONS ----------
-def calc_ev(book_odds, ref_odds):
-    true_prob = 1 / ref_odds
+def calc_ev(book_odds, true_prob):
     return (book_odds * true_prob) - 1
 
-def kelly_units(ev, book_odds):
-    b = book_odds - 1
-    q = 1 - ev
-    kelly = ((ev * b) - q) / b if b > 0 else 0
-    stake = max(kelly * KELLY_FRACTION, 0.5)
-    return round(stake, 2)
+def staking_units(ev):
+    if ev >= 0.12:
+        return 3.0
+    elif ev >= 0.08:
+        return 2.0
+    elif ev >= 0.05:
+        return 1.0
+    return 0.5
 
-def within_time_limit(race_time):
-    now = datetime.now(AU_TZ)
-    return now <= race_time <= now + timedelta(hours=MAX_LOOKAHEAD_HOURS)
+def hours_until_start(start_time):
+    start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    return (start - now).total_seconds() / 3600
 
-# ---------- MAIN EV CHECK FUNCTION ----------
 async def check_races(channel):
-    url = f"https://api.example.com/au/racing/odds?apiKey={API_KEY}&format=json"
+    url = f"https://api.racingapi.com.au/v1/races/upcoming?region={REGION}"
+
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            print("Racing API error", response.status_code)
+        res = requests.get(url, auth=HTTPBasicAuth(RACING_API_USERNAME, RACING_API_PASSWORD), timeout=10)
+        if res.status_code != 200:
+            print(f"Racing API error: {res.status_code}")
             return
-        races = response.json()
+        races = res.json()
     except Exception as e:
-        print("Error fetching races:", e)
+        print(f"Error fetching races: {e}")
         return
 
     for race in races:
-        race_id = race["id"]
-        race_name = race["name"]
-        race_time_str = race["start_time"]  # e.g. ISO format
-        race_time = AU_TZ.localize(datetime.fromisoformat(race_time_str))
+        race_id = race["race_id"]
+        race_name = race["race_name"]
+        start_time = race["start_time"]
+        hrs_to_start = hours_until_start(start_time)
+        if hrs_to_start > MAX_HOURS_TO_START:
+            continue
 
-        if not within_time_limit(race_time):
-            continue  # skip races outside lookahead
+        horses = race.get("horses", [])
+        bookmakers = race.get("bookmakers", [])
 
-        horses = race["horses"]  # list of horses
-        # Example: each horse = {"id":..., "name":..., "odds": {"book1": 5.5, "book2": 5.2,...}}
+        if len(bookmakers) < 2:
+            continue
 
         for horse in horses:
-            horse_id = horse["id"]
             horse_name = horse["name"]
-            odds_dict = horse["odds"]
 
-            # Skip already posted bets
-            if posted_bets.get(race_id, {}).get(horse_id):
+            ref_prices = []
+            for b in bookmakers:
+                if b["name"] in TRUSTED_BOOKS:
+                    try:
+                        price = next(h["price"] for h in b["odds"] if h["horse"] == horse_name)
+                        ref_prices.append(price)
+                    except:
+                        continue
+
+            if len(ref_prices) < 2:
                 continue
 
-            # Determine highest odds & reference odds
-            sorted_books = sorted(odds_dict.items(), key=lambda x: x[1], reverse=True)
-            if not sorted_books:
+            true_prob = sum(1/p for p in ref_prices)/len(ref_prices)
+            if max(ref_prices)/min(ref_prices) > 1.15:
                 continue
-            best_book, best_odds = sorted_books[0]
 
-            # reference odds = average of other books
-            other_odds = [v for k, v in sorted_books[1:]] or [best_odds]
-            ref_odds = sum(other_odds) / len(other_odds)
+            best_price = 0
+            best_book = None
+            supplementary = []
+            line_movement_note = ""
 
-            ev = calc_ev(best_odds, ref_odds)
+            for b in bookmakers:
+                try:
+                    price = next(h["price"] for h in b["odds"] if h["horse"] == horse_name)
+                    key = f"{race_id}-{horse_name}-{b['name']}"
+                    prev_price = last_odds.get(key)
+                    if prev_price and prev_price != price:
+                        line_movement_note += f"📈 {b['name']} moved: {prev_price} → {price}\n"
+                    last_odds[key] = price
+
+                    if price > best_price:
+                        if best_book:
+                            supplementary.append((best_book["name"], best_price))
+                        best_price = price
+                        best_book = b
+                    else:
+                        supplementary.append((b["name"], price))
+                except:
+                    continue
+
+            ev = calc_ev(best_price, true_prob)
             if ev < MIN_EV:
                 continue
 
-            stake = kelly_units(ev, best_odds)
+            bet_key = f"{race_id}-{horse_name}"
+            if bet_key in posted_bets:
+                continue
 
-            # format supplementary bookmakers
-            supplementary = "\n".join([f"- {k}: {v}" for k, v in sorted_books[1:]])
+            units = staking_units(ev)
+            if units <= 0:
+                continue
 
-            # send message
+            posted_bets.add(bet_key)
+
+            sup_text = ""
+            for book, price in sorted(supplementary, key=lambda x: -x[1])[:4]:
+                sup_text += f"• {book}: {price}\n"
+
             msg = (
-                f"🏇 **{race_name}** ({race_time.strftime('%d/%m %H:%M')})\n"
-                f"🐎 {horse_name}\n"
-                f"📍 Best Book: {best_book}\n"
-                f"💰 Odds: {best_odds}\n"
-                f"📊 EV: {round(ev*100,2)}%\n"
-                f"📈 Stake: {stake} Units\n"
+                f"🏇 **+EV BET** 🏇\n\n"
+                f"Race: {race_name}\n"
+                f"Horse: **{horse_name}**\n\n"
+                f"🏆 **Best Odds:** {best_price} ({best_book['name']})\n"
+                f"📊 **EV:** {round(ev*100,2)}%\n"
+                f"📈 **Stake:** {units} units\n"
+                f"⏱ Starts in: {round(hrs_to_start,1)}h\n\n"
+                f"{line_movement_note}"
+                f"📚 **Other Books:**\n{sup_text}"
             )
-            if supplementary:
-                msg += f"\nOther books:\n{supplimentary}"
 
             await channel.send(msg)
 
-            # mark as posted
-            if race_id not in posted_bets:
-                posted_bets[race_id] = {}
-            posted_bets[race_id][horse_id] = True
-
-# ---------- BOT LOOP ----------
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-    client.loop.create_task(racing_loop())
-
-async def racing_loop():
+async def ev_loop():
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
     while True:
         await check_races(channel)
-        await asyncio.sleep(900)  # check every 15 min
+        await asyncio.sleep(CHECK_INTERVAL)
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+    client.loop.create_task(ev_loop())
 
 client.run(TOKEN)
